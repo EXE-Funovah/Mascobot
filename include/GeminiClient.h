@@ -4,14 +4,14 @@
 #include <Arduino.h>
 #include "Config.h"
 
-// Initialise the Gemini REST client.
+// Initialize the Mascoteach Live WebSocket client.
 void setupGemini();
 
-// Call from loop() on Core 0. Processes a pending recording when ready.
+// Call from loop() on Core 0. Maintains WS state and processes pending recordings.
 void loopGemini();
 
 // Called by AudioTask (Core 1) when a full recording buffer is ready.
-// BLOCKS the calling task until the HTTP pipeline is complete.
+// Blocks the calling task until one model turn is finished.
 void onRecordingReady(const uint8_t* pcm16, size_t lenBytes);
 
 #endif

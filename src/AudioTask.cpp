@@ -2,6 +2,8 @@
 #include "GeminiClient.h"
 #include <math.h>
 
+static bool s_speakerTxActive = false;
+
 // -------------------------------------------------------
 // VAD tuning constants
 // -------------------------------------------------------
@@ -52,12 +54,9 @@ void setupI2S() {
     Serial.println("[I2S] Microphone ready.");
 }
 
-// -------------------------------------------------------
-// Speaker playback — tears down mic RX, installs speaker TX,
-// plays PCM, then restores mic RX. Only call while mic task
-// is blocked (e.g. from inside loopGemini on Core 0).
-// -------------------------------------------------------
-void playPCM(const uint8_t* pcm, size_t lenBytes, uint32_t sampleRate) {
+bool beginSpeakerPlayback(uint32_t sampleRate) {
+    if (s_speakerTxActive) return true;
+
     // Uninstall mic driver so we can reuse the BCK/WS pins for TX
     i2s_driver_uninstall(I2S_NUM_0);
 
@@ -84,11 +83,46 @@ void playPCM(const uint8_t* pcm, size_t lenBytes, uint32_t sampleRate) {
 
     esp_err_t err = i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
     if (err != ESP_OK) {
-        Serial.printf("[Speaker] TX driver install FAILED: %d — restoring mic\n", err);
+        Serial.printf("[Speaker] TX driver install FAILED: %d - restoring mic\n", err);
         setupI2S();
-        return;
+        return false;
     }
     i2s_set_pin(I2S_NUM_0, &pins);
+
+    s_speakerTxActive = true;
+    return true;
+}
+
+size_t writeSpeakerPCM(const uint8_t* pcm, size_t lenBytes) {
+    if (!s_speakerTxActive || !pcm || lenBytes == 0) return 0;
+
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, pcm, lenBytes, &written, pdMS_TO_TICKS(500));
+    return written;
+}
+
+void endSpeakerPlayback() {
+    if (!s_speakerTxActive) return;
+
+    // Drain DMA buffers before teardown
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    delay(120);
+
+    i2s_driver_uninstall(I2S_NUM_0);
+    setupI2S();
+    s_speakerTxActive = false;
+    Serial.println("[Speaker] Playback done, mic restored.");
+}
+
+// -------------------------------------------------------
+// Speaker playback — tears down mic RX, installs speaker TX,
+// plays PCM, then restores mic RX. Only call while mic task
+// is blocked (e.g. from inside loopGemini on Core 0).
+// -------------------------------------------------------
+void playPCM(const uint8_t* pcm, size_t lenBytes, uint32_t sampleRate) {
+    if (!beginSpeakerPlayback(sampleRate)) {
+        return;
+    }
 
     Serial.printf("[Speaker] Playing %d KB at %lu Hz...\n", lenBytes / 1024, (unsigned long)sampleRate);
 
@@ -97,19 +131,11 @@ void playPCM(const uint8_t* pcm, size_t lenBytes, uint32_t sampleRate) {
     size_t offset = 0;
     while (offset < lenBytes) {
         size_t toWrite = min(CHUNK, lenBytes - offset);
-        size_t written = 0;
-        i2s_write(I2S_NUM_0, pcm + offset, toWrite, &written, pdMS_TO_TICKS(500));
+        size_t written = writeSpeakerPCM(pcm + offset, toWrite);
         offset += written > 0 ? written : toWrite; // avoid stall if write returns 0
     }
 
-    // Drain DMA buffers before teardown
-    i2s_zero_dma_buffer(I2S_NUM_0);
-    delay(150);
-
-    // Restore mic RX driver
-    i2s_driver_uninstall(I2S_NUM_0);
-    setupI2S();
-    Serial.println("[Speaker] Playback done, mic restored.");
+    endSpeakerPlayback();
 }
 
 // -------------------------------------------------------
@@ -149,8 +175,6 @@ static void micCaptureTask(void* pv) {
     int recFrames    = 0;
     int silenceCount = 0;
     int speechFrames = 0;   // speech frames counted during recording
-    int printSkip    = 0;   // throttle serial in IDLE
-
     Serial.println("[VAD] Listening for speech...");
 
     while (true) {
@@ -162,13 +186,6 @@ static void micCaptureTask(void* pv) {
 
         uint32_t energy  = frameEnergy(frameBuf, samplesRead);
         bool     speech  = (energy > VAD_THRESHOLD);
-
-        // In IDLE: print every 10 frames (~160ms). In RECORDING: print every frame.
-        if (state == RECORDING || ++printSkip >= 10) {
-            printSkip = 0;
-            Serial.printf("[VAD] energy=%5u  threshold=%u  %s\n",
-                          energy, (uint32_t)VAD_THRESHOLD, speech ? "<<< SPEECH" : "silence");
-        }
 
         if (state == IDLE) {
             // Always store in pre-roll ring buffer (overwrites oldest)
@@ -216,6 +233,12 @@ static void micCaptureTask(void* pv) {
                 if (speechFrames >= 3) {
                     onRecordingReady((const uint8_t*)recBuf, totalBytes);
                     // Blocks until loopGemini() finishes and wakes us
+                    Serial.println("[VAD] Task resumed. Flushing hardware startup pop...");
+                    for (int i = 0; i < 60; i++) { // Discard 60 frames (~1 second)
+                        size_t bytesRead = 0;
+                        i2s_read(I2S_NUM_0, frameBuf, FRAME_BYTES, &bytesRead, pdMS_TO_TICKS(100));
+                    }
+
                 } else {
                     Serial.println("[VAD] Skipped — no real speech detected (spurious trigger).");
                 }
